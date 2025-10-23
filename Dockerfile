@@ -30,5 +30,4 @@ EXPOSE 8000
 
 # 9. The command to run your app
 # Gunicorn runs from /app, finds main:app, paths in main.py are relative to /app
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000"] # Or :${PORT:-8080}
-
+CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:8000"]
