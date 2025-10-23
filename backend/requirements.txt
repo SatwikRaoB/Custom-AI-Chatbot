@@ -1,5 +1,13 @@
-fastapi 
-langchain-google-genai 
-langchain 
-faiss-cpu 
-google-generativeai 
+fastapi
+uvicorn[standard] # Keep uvicorn for local dev if needed
+pydantic
+python-dotenv
+google-generativeai
+google-api-python-client
+langchain
+langchain-community
+langchain-huggingface
+pypdf
+sentence-transformers
+faiss-cpu
+gunicorn
