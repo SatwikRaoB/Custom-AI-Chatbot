@@ -1,6 +1,6 @@
 # --- Stage 1: Build Dependencies ---
 # Use the python:3.10 base image
-FROM python:3.10 as builder
+FROM python:3.10-slim as builder
 
 WORKDIR /app
 
@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # --- Stage 2: Final Production Image ---
 
 # Start from a fresh python:3.10 image
-FROM python:3.10
+FROM python:3.10-slim
 
 # Set the final working directory
 WORKDIR /app
