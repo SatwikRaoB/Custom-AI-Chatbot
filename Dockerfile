@@ -58,14 +58,12 @@ RUN mkdir -p ${INDEX_DIR}
 # This runs 'load_vector_store_sync' during the build
 # This is CRITICAL for fast startups on Cloud Run
 ENV LOG_LEVEL=INFO
+
+# --- THIS IS THE CORRECTED LINE ---
+# The python -c command is now all on one line to avoid indentation errors
 RUN echo "--- Building FAISS index for Docker image ---" && \
-    python -c " \
-import logging; \
-logging.basicConfig(level='INFO'); \
-from main import load_vector_store_sync; \
-vs = load_vector_store_sync(); \
-assert vs is not None, 'FAISS Index build FAILED. Check PDFs in data/manuals.'; \
-print('--- FAISS index built successfully ---')"
+    python -c "import logging; logging.basicConfig(level='INFO'); from main import load_vector_store_sync; vs = load_vector_store_sync(); assert vs is not None, 'FAISS Index build FAILED. Check PDFs in data/manuals.'; print('--- FAISS index built successfully ---')"
+# --- END CORRECTION ---
 
 # --- Security: Run as non-root user ---
 # Create a dedicated user
@@ -80,4 +78,4 @@ EXPOSE ${PORT}
 
 # Run the application using Gunicorn (as in your old file)
 # This command correctly uses the $PORT variable provided by Cloud Run
-CMD ["sh", "-c", "gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}"]
+CMD ["sh", "-c","gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}"]
