@@ -11,10 +11,6 @@ venv/
 # Local secrets
 .env
 
-# Local data / build artifacts
-# !! IMPORTANT: Do not copy the local vector store
-vector_store/
-
 # IDE / OS files
 .idea/
 .vscode/
