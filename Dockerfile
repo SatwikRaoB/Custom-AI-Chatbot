@@ -26,7 +26,7 @@ COPY vector_store/support_index/ /app/vector_store/support_index/
 # --- End NEW Section ---
 
 # 8. Expose the port your app will run on
-EXPOSE 8000 # Or 8080 if you switched back
+EXPOSE 8000
 
 # 9. The command to run your app
 # Gunicorn runs from /app, finds main:app, paths in main.py are relative to /app
