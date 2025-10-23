@@ -1,9 +1,7 @@
 # --- Stage 1: Build Dependencies ---
-
 # Use the python:3.10 base image
 FROM python:3.10 as builder
 
-# Set the working directory for this build stage
 WORKDIR /app
 
 # Install 'build-essential' for packages that need to compile C code (like faiss-cpu)
@@ -14,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Create a virtual environment
 RUN python -m venv /opt/venv
 
-# Add the venv to the PATH for this stage
+# Add the venv to the PATH for this build stage
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Copy ONLY the requirements file from your 'backend' folder
@@ -47,35 +45,32 @@ ENV INDEX_DIR /app/vector_store/support_index
 
 # Copy the entire venv (with all packages) from the builder stage
 COPY --from=builder /opt/venv /opt/venv
+
 # Add the venv to the PATH for the final image
 ENV PATH="/opt/venv/bin:$PATH"
+
+# Force Python to look for modules in the venv's site-packages
+ENV PYTHONPATH="/opt/venv/lib/python3.10/site-packages"
 
 # Copy your application code from the 'backend' folder into /app
 COPY backend/. .
 
-# --- PDF and Index Setup ---
-
 # Copy your PDF files from the 'data' folder into the image
 COPY data/manuals/ ./data/manuals/
 
-# Create the directory where the FAISS index will be built
-RUN mkdir -p ${INDEX_DIR}
+# --- THIS IS THE CHANGED SECTION ---
+# As requested, copy the local vector store instead of building it.
+# This assumes you have 'vector_store/support_index' in your project root.
+COPY vector_store/support_index/ /app/vector_store/support_index/
+# --- END CHANGE ---
 
-# Set the log level for the build script
+# Set log level for the app
 ENV LOG_LEVEL=INFO
 
-# --- KEY FIX #1 (ModuleNotFoundError) ---
-# Pre-build the FAISS index *during the build*.
-# We explicitly use '/opt/venv/bin/python' to ensure it finds all installed packages.
-RUN echo "--- Building FAISS index for Docker image ---" && \
-    /opt/venv/bin/python -c "import logging; logging.basicConfig(level='INFO'); from main import load_vector_store_sync; vs = load_vector_store_sync(); assert vs is not None, 'FAISS Index build FAILED. Check PDFs in data/manuals.'; print('--- FAISS index built successfully ---')"
-
 # --- Security Best Practice ---
-
 # Create a new, non-root user to run the application
 RUN useradd --create-home --shell /bin/bash appuser
-# Give this user ownership of the entire /app directory
-# (This includes the code, the data, and the newly built index)
+# Give this user ownership of all app files (code, data, and index)
 RUN chown -R appuser:appuser /app
 # Switch to this non-root user
 USER appuser
@@ -83,8 +78,5 @@ USER appuser
 # Expose the port the container will listen on
 EXPOSE ${PORT}
 
-# --- KEY FIX #2 (Robustness) ---
 # The command to run the app.
-# We use 'sh -c' so that the $PORT variable is correctly used.
-# We explicitly use '/opt/venv/bin/gunicorn' to be 100% sure it's found.
 CMD ["sh", "-c", "/opt/venv/bin/gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}"]
