@@ -1,0 +1,5 @@
+fastapi 
+langchain-google-genai 
+langchain 
+faiss-cpu 
+google-generativeai 
