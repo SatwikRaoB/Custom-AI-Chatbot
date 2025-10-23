@@ -24,3 +24,5 @@ google-genai>=0.1.0
 # Google Custom Search API client
 google-api-python-client>=2.70.0
 
+gunicorn
+
