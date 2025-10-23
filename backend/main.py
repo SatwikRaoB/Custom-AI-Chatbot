@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # LangChain helpers
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -342,3 +342,4 @@ def ask(req: AskRequest):
 logger.info("Registered routes:")
 for r in app.routes:
     logger.info("  %s %s", list(getattr(r, "methods", [])), getattr(r, "path", ""))
+
