@@ -19,10 +19,12 @@ faiss-cpu>=1.7.2
 pypdf>=3.8.0
 
 # Google GenAI (Gemini) SDK
+google-generativeai
 google-genai>=0.1.0
 
 # Google Custom Search API client
 google-api-python-client>=2.70.0
 
 gunicorn
+
 
