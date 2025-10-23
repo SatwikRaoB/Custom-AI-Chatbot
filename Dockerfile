@@ -28,12 +28,9 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Standard environment variables for Python and Cloud Run
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV PORT 8080
+# ... (Standard ENV vars)
 
-# Application-specific env vars
+# Application-specific env vars (Define ABSOLUTE paths)
 ENV DATA_DIR /app/data
 ENV MANUALS_DIR /app/data/manuals
 ENV INDEX_DIR /app/vector_store/support_index
@@ -41,31 +38,33 @@ ENV INDEX_DIR /app/vector_store/support_index
 # Copy the venv from the builder stage
 COPY --from=builder /opt/venv /opt/venv
 
-# Explicitly set PATH to the venv bin directory
+# Explicitly set PATH and PYTHONPATH
 ENV PATH="/opt/venv/bin:$PATH"
+ENV PYTHONPATH="/opt/venv/lib/python3.10/site-packages"
 
-# Copy your application code and data
+# --- CRITICAL FIX: Ensure ALL directories exist and are absolute, created by root ---
+RUN mkdir -p ${DATA_DIR}
+RUN mkdir -p ${MANUALS_DIR}
+RUN mkdir -p ${INDEX_DIR}
+
+# Copy your application code
 COPY backend/. .
-COPY data/manuals/ ./data/manuals/
 
-# --- Index Copy (As requested by the user) ---
-# This assumes the index is pre-built locally and .dockerignore has been updated
-COPY vector_store/support_index/ /app/vector_store/support_index/
-# --- End Index Copy ---
+# Copy data/index files into the absolute directories
+COPY data/manuals/ ${MANUALS_DIR}/
+COPY vector_store/support_index/ ${INDEX_DIR}/
 
 # Set log level
 ENV LOG_LEVEL=INFO
 
-# --- Security Best Practice ---
-# Create a new, non-root user
+# --- CRITICAL FIX: Grant Permissions to the Non-Root User ---
 RUN useradd --create-home --shell /bin/bash appuser
-# Give ownership to the new user
+# This fixes PermissionError [Errno 13] by granting ownership of everything under /app
 RUN chown -R appuser:appuser /app
-# Switch to this non-root user
+# Switch to the non-root user
 USER appuser
 
 EXPOSE ${PORT}
 
-# The command to run the app in production.
-# Explicitly uses /opt/venv/bin/gunicorn for robustness.
+# The command to run the app.
 CMD ["sh", "-c", "/opt/venv/bin/gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}"]
