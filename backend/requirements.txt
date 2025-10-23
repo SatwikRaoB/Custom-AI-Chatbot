@@ -1,31 +1,26 @@
-# Core web framework
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0
+fastapi==0.119.0
+uvicorn[standard]>=0.21.1,<0.38.0
 
-# Environment variables
-python-dotenv>=1.0.1
+python-dotenv==1.0.0
+pydantic==2.7.0
 
-# Logging utilities (part of stdlib, no need to include)
-# but optional extra tools for structured logging
-loguru>=0.7.2
+# LangChain core and community integrations (imports use langchain and langchain_community)
+langchain>=0.3.0,<1.0
+langchain-community==0.4
 
-# LangChain ecosystem
-langchain>=0.2.14
-langchain-community>=0.2.12
+# Hugging Face embeddings integration (import: from langchain_huggingface import HuggingFaceEmbeddings)
 langchain-huggingface>=0.0.3
 
-# Vector store backend
-faiss-cpu>=1.8.0
-sentence-transformers>=3.0.0
+# Sentence Transformers (embedding model backend required by HuggingFaceEmbeddings)
+sentence-transformers>=2.2.2,<5.0.0
 
-# PDF document loading
-pypdf>=4.0.0
+# FAISS vector store (binary wheels are platform dependent; see notes below)
+faiss-cpu>=1.7.2
 
-# Google Generative AI SDK (Gemini)
-google-generativeai>=0.6.0
+# PDF loader used by langchain-community's PyPDFLoader (uses pypdf)
+pypdf>=3.8.0
 
-# Google Custom Search API
-google-api-python-client>=2.132.0
+# Google GenAI SDK (Gemini) - used as `from google import genai`
+google-genai>=0.0.1
 
-# Typing and models
-pydantic>=2.7.0
+# Google Custom Search (google-api-python-client
