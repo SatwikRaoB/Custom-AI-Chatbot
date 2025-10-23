@@ -24,3 +24,4 @@ pypdf>=3.8.0
 google-genai>=0.0.1
 
 # Google Custom Search (google-api-python-client
+google-api-python-client>=2.70.0
