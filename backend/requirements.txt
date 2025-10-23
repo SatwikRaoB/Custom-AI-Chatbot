@@ -2,26 +2,28 @@ fastapi==0.119.0
 uvicorn[standard]>=0.21.1,<0.38.0
 
 python-dotenv==1.0.0
-pydantic==2.7.0
 
-# LangChain core and community integrations (imports use langchain and langchain_community)
-langchain>=0.3.0,<1.0
-langchain-community==0.4
+# Use Pydantic 2 but >=2.7.4 as required by langchain 0.3.x
+pydantic>=2.7.4,<3.0.0
 
-# Hugging Face embeddings integration (import: from langchain_huggingface import HuggingFaceEmbeddings)
+# LangChain (0.3.x series uses Pydantic v2)
+langchain>=0.3.0,<0.4.0
+langchain-community>=0.3.24,<0.5.0
+
+# Hugging Face integration used in your imports
 langchain-huggingface>=0.0.3
 
-# Sentence Transformers (embedding model backend required by HuggingFaceEmbeddings)
+# Embedding backend
 sentence-transformers>=2.2.2,<5.0.0
 
-# FAISS vector store (binary wheels are platform dependent; see notes below)
+# FAISS (platform-specific wheels may be needed)
 faiss-cpu>=1.7.2
 
-# PDF loader used by langchain-community's PyPDFLoader (uses pypdf)
+# PDF loader used by PyPDFLoader
 pypdf>=3.8.0
 
-# Google GenAI SDK (Gemini) - used as `from google import genai`
-google-genai>=0.0.1
+# Google GenAI (Gemini) SDK
+google-genai>=0.1.0
 
-# Google Custom Search (google-api-python-client
+# Google Custom Search API client
 google-api-python-client>=2.70.0
