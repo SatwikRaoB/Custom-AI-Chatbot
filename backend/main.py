@@ -57,6 +57,13 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
+# --- HuggingFace Token ---
+# The token is read from the environment variable (which you set in Cloud Run)
+HF_TOKEN = os.getenv("HF_TOKEN")
+if not HF_TOKEN:
+    logger.warning("HF_TOKEN environment variable is not set. Rate limiting may occur.")
+# --- End HF Token ---
+
 # Max tokens
 try:
     GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "512"))
@@ -145,14 +152,17 @@ async def load_vector_store() -> Optional[Any]:
 
     index_file = INDEX_DIR / "index.faiss"
     if not index_file.exists():
-        logger.error("Pre-built index missing at {INDEX_DIR}")
+        logger.error(f"Pre-built index missing at {INDEX_DIR}")
         return None
 
     try:
         # Model is cached in /home/appuser/.cache/huggingface
         embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
-            cache_folder="/home/appuser/.cache/huggingface"
+            cache_folder="/home/appuser/.cache/huggingface",
+            # --- FIX: Pass HF Token here ---
+            # This passes the token to the HuggingFace client for authorization/rate limit bypass
+            model_kwargs={"token": HF_TOKEN} if HF_TOKEN else {} 
         )
         vs = FAISS.load_local(
             str(INDEX_DIR),
@@ -162,7 +172,8 @@ async def load_vector_store() -> Optional[Any]:
         logger.info("Pre-built FAISS index loaded instantly.")
         return vs
     except Exception as e:
-        logger.error(f"Failed to load index: {e}")
+        # The 429 error occurs here when model initialization is blocked
+        logger.error(f"Failed to load index: There was a specific connection error when trying to load {EMBEDDING_MODEL}: {e}")
         return None
 
 # --- Gemini & Search ---
@@ -315,5 +326,3 @@ async def ask(req: AskRequest):
     if len(fallback) > 4000:
         fallback = fallback[:3900] + "\n\n...[truncated]"
     return {"answer": fallback, "sources": sources, "source_context": display_ctx}
-
-
