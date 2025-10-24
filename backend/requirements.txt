@@ -21,10 +21,12 @@ pypdf>=3.8.0
 # Google GenAI (Gemini) SDK
 google-generativeai
 google-genai>=0.1.0
+google-cloud-storage
 
 # Google Custom Search API client
 google-api-python-client>=2.70.0
 
 gunicorn
+
 
 
