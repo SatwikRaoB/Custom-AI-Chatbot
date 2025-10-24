@@ -1,21 +1,32 @@
+"""
+RAG Support Chatbot - Pre-built Index + Cached Model
+Docker-safe, non-root, instant startup.
+"""
+
 import os
 import logging
 from pathlib import Path
 from typing import List, Optional, Any, Dict
 
+# --- Core ---
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
 
+# --- LangChain ---
 from langchain_core.documents import Document
+
+# --- Google ---
 import google.generativeai as genai
 from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError
 
+# --- Load .env ---
 load_dotenv()
 
+# --- Logging ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -24,8 +35,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rag-chatbot")
 
-# --- Paths ---
-APP_ROOT = Path(__file__).resolve().parent
+# --- Paths (inside /app/backend) ---
+APP_ROOT = Path(__file__).resolve().parent  # /app/backend
+
 DATA_DIR = (APP_ROOT / "data").resolve()
 MANUALS_DIR = (DATA_DIR / "manuals").resolve()
 INDEX_DIR = (APP_ROOT / "vector_store" / "support_index").resolve()
@@ -34,7 +46,7 @@ logger.info(f"APP_ROOT: {APP_ROOT}")
 logger.info(f"MANUALS_DIR: {MANUALS_DIR}")
 logger.info(f"INDEX_DIR: {INDEX_DIR}")
 
-# --- Config (NO _safe_int) ---
+# --- Config (no helpers) ---
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -43,7 +55,7 @@ TOP_K = int(os.getenv("TOP_K", "3"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 # Max tokens
 try:
@@ -64,8 +76,7 @@ if temp_str:
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", API_KEY_TO_USE)
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
-
-# --- Lazy-loaded type hints ---
+# --- Lazy type hints ---
 RecursiveCharacterTextSplitter: Optional[Any] = None
 PyPDFLoader: Optional[Any] = None
 HuggingFaceEmbeddings: Optional[Any] = None
@@ -86,18 +97,13 @@ _genai_lock = asyncio.Lock()
 
 # --- Lazy imports ---
 async def import_langchain():
-    global RecursiveCharacterTextSplitter, PyPDFLoader, HuggingFaceEmbeddings, FAISS
+    global HuggingFaceEmbeddings, FAISS
     async with _langchain_lock:
         if FAISS is not None:
             return
         try:
-            from langchain.text_splitter import RecursiveCharacterTextSplitter as RCS
-            from langchain_community.document_loaders import PyPDFLoader as PDFL
             from langchain_huggingface import HuggingFaceEmbeddings as HFE
             from langchain_community.vectorstores import FAISS as FAISSStore
-
-            RecursiveCharacterTextSplitter = RCS
-            PyPDFLoader = PDFL
             HuggingFaceEmbeddings = HFE
             FAISS = FAISSStore
             logger.debug("LangChain loaded.")
@@ -131,85 +137,33 @@ class AskRequest(BaseModel):
     web_search: Optional[bool] = False
     web_num_results: Optional[int] = 3
 
-# --- PDF & FAISS ---
-async def load_pdfs() -> List[Document]:
-    await import_langchain()
-    if not PyPDFLoader:
-        return []
-
-    if not MANUALS_DIR.exists():
-        logger.warning(f"Manuals dir missing: {MANUALS_DIR}")
-        return []
-
-    pdf_files = sorted(MANUALS_DIR.glob("*.pdf"))
-    if not pdf_files:
-        logger.info("No PDFs found.")
-        return []
-
-    docs: List[Document] = []
-    for pdf in pdf_files:
-        try:
-            loader = PyPDFLoader(str(pdf))
-            pages = loader.load()
-            for p in pages:
-                p.metadata["source"] = pdf.name
-            docs.extend(pages)
-        except Exception as e:
-            logger.error(f"Failed to load {pdf.name}: {e}")
-    logger.info(f"Loaded {len(docs)} pages from {len(pdf_files)} PDFs.")
-    return docs
-
-async def chunk_documents(docs: List[Document]) -> List[Document]:
-    await import_langchain()
-    if not RecursiveCharacterTextSplitter or not docs:
-        return []
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    return splitter.split_documents(docs)
-
-async def build_faiss(docs: List[Document]) -> Optional[Any]:
-    await import_langchain()
-    if not HuggingFaceEmbeddings or not FAISS or not docs:
-        return None
-    try:
-        embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-        vs = FAISS.from_documents(docs, embeddings)
-        vs.save_local(str(INDEX_DIR))
-        logger.info(f"FAISS index saved to {INDEX_DIR}")
-        return vs
-    except Exception as e:
-        logger.error(f"FAISS build failed: {e}")
-        return None
-
+# --- Load pre-built index (no rebuild) ---
 async def load_vector_store() -> Optional[Any]:
     await import_langchain()
     if not FAISS or not HuggingFaceEmbeddings:
         return None
 
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
     index_file = INDEX_DIR / "index.faiss"
-
-    if index_file.exists():
-        try:
-            vs = FAISS.load_local(
-                str(INDEX_DIR), embeddings,
-                allow_dangerous_deserialization=True  # Safe: built in CI
-            )
-            logger.info("Loaded FAISS index.")
-            return vs
-        except Exception as e:
-            logger.warning(f"Index load failed: {e}. Rebuilding...")
-
-    logger.info("Building FAISS index from PDFs...")
-    pages = await load_pdfs()
-    if not pages:
-        logger.error("No PDF content.")
+    if not index_file.exists():
+        logger.error("Pre-built index missing at {INDEX_DIR}")
         return None
 
-    chunks = await chunk_documents(pages)
-    if not chunks:
+    try:
+        # Model is cached in /home/appuser/.cache/huggingface
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL,
+            cache_folder="/home/appuser/.cache/huggingface"
+        )
+        vs = FAISS.load_local(
+            str(INDEX_DIR),
+            embeddings,
+            allow_dangerous_deserialization=True  # Safe: built in CI
+        )
+        logger.info("Pre-built FAISS index loaded instantly.")
+        return vs
+    except Exception as e:
+        logger.error(f"Failed to load index: {e}")
         return None
-
-    return await build_faiss(chunks)
 
 # --- Gemini & Search ---
 async def get_genai_model() -> Optional[Any]:
@@ -277,13 +231,13 @@ def google_search(query: str, num: int) -> List[Dict]:
 # --- Startup ---
 @app.on_event("startup")
 async def startup():
-    logger.info("Starting up: loading FAISS index...")
+    logger.info("Starting up: loading pre-built index...")
     vs = await load_vector_store()
     app_state["vector_store"] = vs
     if vs:
         logger.info("RAG ready.")
     else:
-        logger.error("RAG failed to load.")
+        logger.error("RAG index failed to load.")
 
 # --- Endpoints ---
 @app.get("/")
@@ -295,15 +249,6 @@ def health():
     vs = app_state["vector_store"]
     num = len(getattr(vs, "index_to_docstore_id", {})) if vs else 0
     return {"status": "ok", "index_ready": vs is not None, "docs": num}
-
-@app.post("/reindex")
-async def reindex():
-    logger.info("Reindexing...")
-    vs = await load_vector_store()
-    app_state["vector_store"] = vs
-    if not vs:
-        raise HTTPException(500, "Reindex failed")
-    return {"status": "ok", "docs": len(vs.index_to_docstore_id)}
 
 @app.post("/ask")
 async def ask(req: AskRequest):
@@ -376,5 +321,3 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
-
-
