@@ -27,7 +27,7 @@ WORKDIR /app
 ENV DATA_DIR=/app/backend/data \
     MANUALS_DIR=/app/backend/data/manuals \
     INDEX_DIR=/app/backend/vector_store/support_index \
-    PORT=8080
+    PORT=8000
 
 RUN useradd -m appuser
 
