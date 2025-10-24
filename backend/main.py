@@ -1,32 +1,21 @@
-"""
-FastAPI RAG Chatbot: PDF manuals + optional Web Search + Gemini
-Docker-safe, non-root, lazy-loaded, production-ready.
-"""
-
 import os
 import logging
 from pathlib import Path
 from typing import List, Optional, Any, Dict
 
-# --- Core ---
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
 
-# --- LangChain ---
 from langchain_core.documents import Document
-
-# --- Google ---
 import google.generativeai as genai
 from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError
 
-# --- Load .env early ---
 load_dotenv()
 
-# --- Logging ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -35,19 +24,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rag-chatbot")
 
-# --- Docker-safe absolute paths (ALL INSIDE /app) ---
-APP_ROOT = Path(__file__).resolve().parent  # /app
-
+# --- Paths ---
+APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = (APP_ROOT / "data").resolve()
 MANUALS_DIR = (DATA_DIR / "manuals").resolve()
 INDEX_DIR = (APP_ROOT / "vector_store" / "support_index").resolve()
 
 logger.info(f"APP_ROOT: {APP_ROOT}")
-logger.info(f"DATA_DIR: {DATA_DIR}")
 logger.info(f"MANUALS_DIR: {MANUALS_DIR}")
 logger.info(f"INDEX_DIR: {INDEX_DIR}")
 
-# --- Config ---
+# --- Config (NO _safe_int) ---
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
@@ -56,32 +43,27 @@ TOP_K = int(os.getenv("TOP_K", "3"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY
-
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_MAX_TOKENS = _safe_int(os.getenv("GEMINI_MAX_TOKENS", "512"), 512)
-GEMINI_TEMPERATURE = _safe_float(os.getenv("GEMINI_TEMPERATURE"))
+
+# Max tokens
+try:
+    GEMINI_MAX_TOKENS = int(os.getenv("GEMINI_MAX_TOKENS", "512"))
+except (ValueError, TypeError):
+    logger.warning("Invalid GEMINI_MAX_TOKENS. Using 512")
+    GEMINI_MAX_TOKENS = 512
+
+# Temperature
+GEMINI_TEMPERATURE = None
+temp_str = os.getenv("GEMINI_TEMPERATURE")
+if temp_str:
+    try:
+        GEMINI_TEMPERATURE = float(temp_str)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid GEMINI_TEMPERATURE: '{temp_str}'. Ignoring.")
 
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", API_KEY_TO_USE)
 GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
-# --- Safe conversion helpers ---
-def _safe_int(value: Optional[str], default: int) -> int:
-    if not value:
-        return default
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        logger.warning(f"Invalid int: '{value}'. Using {default}")
-        return default
-
-def _safe_float(value: Optional[str]) -> Optional[float]:
-    if not value:
-        return None
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        logger.warning(f"Invalid float: '{value}'. Ignoring.")
-        return None
 
 # --- Lazy-loaded type hints ---
 RecursiveCharacterTextSplitter: Optional[Any] = None
@@ -217,7 +199,7 @@ async def load_vector_store() -> Optional[Any]:
         except Exception as e:
             logger.warning(f"Index load failed: {e}. Rebuilding...")
 
-    logger48.info("Building FAISS index from PDFs...")
+    logger.info("Building FAISS index from PDFs...")
     pages = await load_pdfs()
     if not pages:
         logger.error("No PDF content.")
@@ -394,3 +376,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+
