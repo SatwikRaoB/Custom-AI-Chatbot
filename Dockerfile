@@ -2,58 +2,53 @@
 FROM python:3.10-slim AS builder
 WORKDIR /app
 
-# Build tools + BLAS for FAISS / numpy
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libblas3 liblapack3 libopenblas-dev \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    build-essential libblas3 libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Virtual-env
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy code + data
+COPY backend/. .
+COPY backend/data/manuals/ /app/backend/data/manuals/
+
+# Build index (downloads + caches model)
+COPY build_index.py .
+RUN python build_index.py
 
 # ---------- Runtime ----------
 FROM python:3.10-slim
-
 WORKDIR /app
 
-# ---- ENV defaults (ALL inside /app) ----
-ENV DATA_DIR=/app/data \
-    MANUALS_DIR=/app/data/manuals \
-    INDEX_DIR=/app/vector_store/support_index \
-    LOG_LEVEL=INFO \
+ENV DATA_DIR=/app/backend/data \
+    MANUALS_DIR=/app/backend/data/manuals \
+    INDEX_DIR=/app/backend/vector_store/support_index \
     PORT=8000
 
-# ---- Non-root user (created early) ----
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd -m appuser
 
-# ---- Create *all* required directories and give ownership ----
 RUN mkdir -p ${DATA_DIR} ${MANUALS_DIR} ${INDEX_DIR} \
     && chown -R appuser:appuser /app
 
-# ---- Copy venv (owned by appuser) ----
+# Copy venv
 COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# ---- Application code ----
+# Copy app + data
 COPY --chown=appuser:appuser backend/. .
+COPY --chown=appuser:appuser backend/data/manuals/ ${MANUALS_DIR}/
 
-# ---- Static data (PDF manuals) ----
-COPY --chown=appuser:appuser data/manuals/ ${MANUALS_DIR}/
+# Copy pre-built index
+COPY --from=builder --chown=appuser:appuser /app/backend/vector_store/support_index/ ${INDEX_DIR}/
 
-# ---- Pre-built index (optional – if you ship it) ----
-COPY --chown=appuser:appuser vector_store/support_index/ ${INDEX_DIR}/
+# --- COPY HF CACHE (critical!) ---
+COPY --from=builder --chown=appuser:appuser /root/.cache/huggingface /home/appuser/.cache/huggingface
 
-# ---- Switch to non-root ----
 USER appuser
-
 EXPOSE ${PORT}
 
-# ---- Health-check (optional but recommended) ----
-HEALTHCHECK CMD curl -f http://localhost:${PORT}/health || exit 1
-
-# ---- Entrypoint ----
-CMD ["sh", "-c", "gunicorn -w 4 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:${PORT}"]
+CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:${PORT}"]
