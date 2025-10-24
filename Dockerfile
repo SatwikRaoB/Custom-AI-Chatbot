@@ -30,7 +30,8 @@ WORKDIR /app
 # ----- ENV (NO PORT – Cloud Run injects it) -----
 ENV DATA_DIR=/app/backend/data \
     MANUALS_DIR=/app/backend/data/manuals \
-    INDEX_DIR=/app/backend/vector_store/support_index
+    INDEX_DIR=/app/backend/vector_store/support_index \
+    PORT=8000
 
 # Non-root user
 RUN useradd -m appuser
