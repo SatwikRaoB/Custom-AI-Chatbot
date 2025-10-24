@@ -1,595 +1,396 @@
 """
-FastAPI backend: PDF-backed RAG + optional Google Web Search + Gemini generation.
-Docker-safe paths, corrected imports, FAISS loaded on startup, other clients lazy-loaded.
+FastAPI RAG Chatbot: PDF manuals + optional Web Search + Gemini
+Docker-safe, non-root, lazy-loaded, production-ready.
 """
+
 import os
 import logging
 from pathlib import Path
-from typing import List, Optional, Any, Dict, Type # Added Type for clarity
+from typing import List, Optional, Any, Dict
 
-# --- Core FastAPI & Pydantic ---
-from fastapi import FastAPI, HTTPException, Request
+# --- Core ---
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import asyncio
 
-# --- LangChain Core Imports (Safe to import early) ---
+# --- LangChain ---
 from langchain_core.documents import Document
 
-# --- Google GenAI Core Imports (Safe to import early) ---
-# Import the main module. Specific classes will be handled lazily if needed.
+# --- Google ---
 import google.generativeai as genai
-# REMOVED: from google.generativeai.types import GenerativeModel, GenerationConfig
-
-# --- Google API Client Core Imports (Safe to import early) ---
 from googleapiclient.discovery import build as google_build
 from googleapiclient.errors import HttpError
 
-# --- Load environment early ---
-load_dotenv() # Reads .env if present
+# --- Load .env early ---
+load_dotenv()
 
+# --- Logging ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-# Ensure logs go to stdout/stderr for Cloud Run
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
-logger = logging.getLogger("backend")
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger("rag-chatbot")
 
-# --- CORRECTED PATH CALCULATIONS for Docker ---
-# We ensure all paths resolve to absolute, non-relative paths inside /app
-APP_ROOT = Path(__file__).resolve().parent # /app inside container
+# --- Docker-safe absolute paths (ALL INSIDE /app) ---
+APP_ROOT = Path(__file__).resolve().parent  # /app
 
-# Define fallback paths using clean absolute strings
-DEFAULT_DATA_DIR = str(APP_ROOT / "data")
-DEFAULT_MANUALS_DIR = str(APP_ROOT / "data" / "manuals")
-DEFAULT_INDEX_DIR = str(APP_ROOT / "vector_store" / "support_index")
+DATA_DIR = (APP_ROOT / "data").resolve()
+MANUALS_DIR = (DATA_DIR / "manuals").resolve()
+INDEX_DIR = (APP_ROOT / "vector_store" / "support_index").resolve()
 
-# Read from ENV or use the absolute fallback path
-DATA_DIR = Path(os.getenv("DATA_DIR", DEFAULT_DATA_DIR)).resolve()
-MANUALS_DIR = Path(os.getenv("MANUALS_DIR", DEFAULT_MANUALS_DIR)).resolve()
-INDEX_DIR = Path(os.getenv("INDEX_DIR", DEFAULT_INDEX_DIR)).resolve()
+logger.info(f"APP_ROOT: {APP_ROOT}")
+logger.info(f"DATA_DIR: {DATA_DIR}")
+logger.info(f"MANUALS_DIR: {MANUALS_DIR}")
+logger.info(f"INDEX_DIR: {INDEX_DIR}")
 
-logger.info(f"Running from: {Path(__file__).resolve()}")
-logger.info(f"Calculated APP_ROOT: {APP_ROOT}")
-logger.info(f"Calculated DATA_DIR: {DATA_DIR}")
-logger.info(f"Calculated MANUALS_DIR: {MANUALS_DIR}")
-logger.info(f"Calculated INDEX_DIR: {INDEX_DIR}")
-
-# --- Configuration Values ---
+# --- Config ---
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
 TOP_K = int(os.getenv("TOP_K", "3"))
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", None)
-API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY # Prefer GOOGLE_API_KEY if both set
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY
 
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_MAX_TOKENS_STR = os.getenv("GEMINI_MAX_TOKENS", "512")
-GEMINI_TEMPERATURE_STR = os.getenv("GEMINI_TEMPERATURE", None)
+GEMINI_MAX_TOKENS = _safe_int(os.getenv("GEMINI_MAX_TOKENS", "512"), 512)
+GEMINI_TEMPERATURE = _safe_float(os.getenv("GEMINI_TEMPERATURE"))
 
-GEMINI_MAX_TOKENS: Optional[int] = None
-try:
-    GEMINI_MAX_TOKENS = int(GEMINI_MAX_TOKENS_STR)
-except (ValueError, TypeError):
-    logger.warning(f"Invalid GEMINI_MAX_TOKENS value: '{GEMINI_MAX_TOKENS_STR}'. Using default.")
-    GEMINI_MAX_TOKENS = 512 # Fallback default
+GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", API_KEY_TO_USE)
+GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID")
 
-GEMINI_TEMPERATURE: Optional[float] = None
-if GEMINI_TEMPERATURE_STR is not None:
+# --- Safe conversion helpers ---
+def _safe_int(value: Optional[str], default: int) -> int:
+    if not value:
+        return default
     try:
-        GEMINI_TEMPERATURE = float(GEMINI_TEMPERATURE_STR)
+        return int(value)
     except (ValueError, TypeError):
-        logger.warning(f"Invalid GEMINI_TEMPERATURE value: '{GEMINI_TEMPERATURE_STR}'. Disabling temperature setting.")
+        logger.warning(f"Invalid int: '{value}'. Using {default}")
+        return default
 
-GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY", API_KEY_TO_USE) # Default to main key
-GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", None)
+def _safe_float(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        logger.warning(f"Invalid float: '{value}'. Ignoring.")
+        return None
 
-# --- Type Hinting for LangChain components (loaded later) ---
-RecursiveCharacterTextSplitter: Optional[Type[Any]] = None
-PyPDFLoader: Optional[Type[Any]] = None
-HuggingFaceEmbeddings: Optional[Type[Any]] = None
-FAISS: Optional[Type[Any]] = None
+# --- Lazy-loaded type hints ---
+RecursiveCharacterTextSplitter: Optional[Any] = None
+PyPDFLoader: Optional[Any] = None
+HuggingFaceEmbeddings: Optional[Any] = None
+FAISS: Optional[Any] = None
+GenerativeModel: Optional[Any] = None
+GenerationConfig: Optional[Any] = None
 
-# --- Type Hinting for GenAI components (Corrected) ---
-GenerativeModel: Optional[Type[Any]] = None
-GenerationConfig: Optional[Type[Any]] = None
-
-# --- Global state dictionary ---
+# --- Global state ---
 app_state: Dict[str, Any] = {
     "vector_store": None,
     "genai_model": None,
     "google_search": None,
 }
 
-# --- Lazy Import Function (Consolidated) ---
-_langchain_imported = False
-def import_langchain_dependencies():
-    global _langchain_imported, RecursiveCharacterTextSplitter, PyPDFLoader, HuggingFaceEmbeddings, FAISS
-    if not _langchain_imported:
-        logger.debug("Lazily importing LangChain dependencies...")
+# --- Lazy import locks ---
+_langchain_lock = asyncio.Lock()
+_genai_lock = asyncio.Lock()
+
+# --- Lazy imports ---
+async def import_langchain():
+    global RecursiveCharacterTextSplitter, PyPDFLoader, HuggingFaceEmbeddings, FAISS
+    async with _langchain_lock:
+        if FAISS is not None:
+            return
         try:
-            from langchain.text_splitter import RecursiveCharacterTextSplitter as RCSplitter
-            from langchain_community.document_loaders import PyPDFLoader as PDFLoader
-            from langchain_huggingface import HuggingFaceEmbeddings as HFEmbeddings
+            from langchain.text_splitter import RecursiveCharacterTextSplitter as RCS
+            from langchain_community.document_loaders import PyPDFLoader as PDFL
+            from langchain_huggingface import HuggingFaceEmbeddings as HFE
             from langchain_community.vectorstores import FAISS as FAISSStore
 
-            RecursiveCharacterTextSplitter = RCSplitter
-            PyPDFLoader = PDFLoader
-            HuggingFaceEmbeddings = HFEmbeddings
+            RecursiveCharacterTextSplitter = RCS
+            PyPDFLoader = PDFL
+            HuggingFaceEmbeddings = HFE
             FAISS = FAISSStore
-            _langchain_imported = True
-            logger.debug("LangChain dependencies imported successfully.")
+            logger.debug("LangChain loaded.")
         except ImportError as e:
-            logger.error(f"Failed to import LangChain dependencies: {e}. RAG features will be unavailable.", exc_info=True)
+            logger.error(f"LangChain import failed: {e}. RAG disabled.")
 
-# Corrected GenAI lazy import - Import classes directly from genai
-_genai_imported = False
-def import_genai_dependencies():
-    global _genai_imported, genai, GenerativeModel, GenerationConfig
-    if not _genai_imported:
-        logger.debug("Lazily importing Google GenAI dependencies...")
+async def import_genai():
+    global GenerativeModel, GenerationConfig
+    async with _genai_lock:
+        if GenerativeModel is not None:
+            return
         try:
-            import google.generativeai as genai_module
-            genai = genai_module # Assign to global genai if needed elsewhere
             GenerativeModel = genai.GenerativeModel
-            GenerationConfig = genai.types.GenerationConfig # GenerationConfig *might* still be under types
-            _genai_imported = True
-            logger.debug("Google GenAI dependencies imported.")
-        except AttributeError:
-             # Fallback if GenerationConfig is also directly under genai
-             try:
-                 GenerationConfig = genai.GenerationConfig
-                 _genai_imported = True
-                 logger.debug("Google GenAI dependencies imported (GenerationConfig found directly under genai).")
-             except AttributeError as e_inner:
-                  logger.error(f"Failed to import GenAI classes: {e_inner}", exc_info=True)
-        except ImportError as e:
-            logger.error(f"Failed to import Google GenAI dependencies: {e}", exc_info=True)
+            GenerationConfig = genai.GenerationConfig
+            logger.debug("Gemini classes loaded.")
+        except Exception as e:
+            logger.error(f"GenAI import failed: {e}")
 
-
-_google_search_imported = False
-def import_google_search_dependencies():
-     global _google_search_imported, google_build, HttpError
-     if not _google_search_imported:
-        logger.debug("Lazily importing Google Search dependencies...")
-        try:
-            from googleapiclient.discovery import build as google_api_build
-            from googleapiclient.errors import HttpError as GoogleHttpError
-            google_build = google_api_build
-            HttpError = GoogleHttpError
-            _google_search_imported = True
-            logger.debug("Google Search dependencies imported.")
-        except ImportError as e:
-            logger.error(f"Failed to import Google Search dependencies: {e}", exc_info=True)
-
-
-# --- FastAPI App Initialization ---
-app = FastAPI(title="Customer Support Chatbot Backend (RAG + Web Search + Gemini)")
+# --- FastAPI App ---
+app = FastAPI(title="RAG Support Chatbot")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Adjust for production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# --- Request Model ---
 class AskRequest(BaseModel):
     question: str
     web_search: Optional[bool] = False
     web_num_results: Optional[int] = 3
 
-# --- PDF & FAISS Utilities ---
-# (Functions load_pdfs, chunk_documents, build_faiss remain the same conceptually,
-# relying on the updated import_langchain_dependencies)
-def load_pdfs(manuals_dir: Path) -> List[Document]:
-    import_langchain_dependencies()
-    if not PyPDFLoader: return [] # Check if import failed
+# --- PDF & FAISS ---
+async def load_pdfs() -> List[Document]:
+    await import_langchain()
+    if not PyPDFLoader:
+        return []
+
+    if not MANUALS_DIR.exists():
+        logger.warning(f"Manuals dir missing: {MANUALS_DIR}")
+        return []
+
+    pdf_files = sorted(MANUALS_DIR.glob("*.pdf"))
+    if not pdf_files:
+        logger.info("No PDFs found.")
+        return []
 
     docs: List[Document] = []
-    # FIX: We rely on the Dockerfile to create the directory, but still ensure it exists here.
-    # The PermissionError/FileNotFoundError suggests the initial path resolution was wrong.
-    # We remove the old error-prone code that created the paths incorrectly, relying on the 
-    # absolute paths defined at the top of the file.
-    if not manuals_dir.exists():
-        logger.warning(f"Manuals directory not found: {manuals_dir}. Attempting to create it (should be done by Dockerfile).")
-        # Try to create it just in case, using the now absolute path
-        try:
-            manuals_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            # We expect this to be fixed by the Dockerfile, log but continue gracefully if empty.
-            logger.error(f"Failed to create directory {manuals_dir} during load: {e}")
-            return docs
-        
-    logger.info(f"Looking for PDF files in: {manuals_dir.resolve()}")
-    pdf_files = sorted(list(manuals_dir.glob("*.pdf")))
-    if not pdf_files:
-        logger.warning(f"No PDF files found in {manuals_dir}")
-        return docs
-
-    logger.info(f"Found {len(pdf_files)} PDF files to load.")
     for pdf in pdf_files:
         try:
             loader = PyPDFLoader(str(pdf))
-            pages = loader.load_and_split()
-            logger.debug(f"Loaded {len(pages)} pages from {pdf.name}")
+            pages = loader.load()
             for p in pages:
-                p.metadata = p.metadata or {}
                 p.metadata["source"] = pdf.name
             docs.extend(pages)
         except Exception as e:
-            logger.error(f"Failed to load or process PDF {pdf.name}: {e}", exc_info=True)
-    logger.info(f"Successfully loaded a total of {len(docs)} pages from {len(pdf_files)} files.")
+            logger.error(f"Failed to load {pdf.name}: {e}")
+    logger.info(f"Loaded {len(docs)} pages from {len(pdf_files)} PDFs.")
     return docs
 
-def chunk_documents(docs: List[Document]) -> List[Document]:
-    import_langchain_dependencies()
-    if not RecursiveCharacterTextSplitter: return []
-    if not docs: return []
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-    )
-    try:
-        chunks = splitter.split_documents(docs)
-        logger.info(f"Split {len(docs)} documents into {len(chunks)} chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}).")
-        return chunks
-    except Exception as e:
-        logger.error(f"Failed to split documents: {e}", exc_info=True)
+async def chunk_documents(docs: List[Document]) -> List[Document]:
+    await import_langchain()
+    if not RecursiveCharacterTextSplitter or not docs:
         return []
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    return splitter.split_documents(docs)
 
-def build_faiss(docs: List[Document], index_dir: Path) -> Optional[Any]:
-    import_langchain_dependencies()
-    if not HuggingFaceEmbeddings or not FAISS: return None
-    if not docs:
-        logger.error("Attempted to build FAISS index with no document chunks.")
+async def build_faiss(docs: List[Document]) -> Optional[Any]:
+    await import_langchain()
+    if not HuggingFaceEmbeddings or not FAISS or not docs:
         return None
-
     try:
-        logger.info(f"Initializing embedding model: {EMBEDDING_MODEL}")
         embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-        logger.info(f"Building FAISS index (this may take time)...")
         vs = FAISS.from_documents(docs, embeddings)
-        index_dir.mkdir(parents=True, exist_ok=True)
-        vs.save_local(str(index_dir))
-        logger.info(f"Successfully built and saved FAISS index to {index_dir.resolve()}")
+        vs.save_local(str(INDEX_DIR))
+        logger.info(f"FAISS index saved to {INDEX_DIR}")
         return vs
     except Exception as e:
-        logger.error(f"Error building FAISS index: {e}", exc_info=True)
+        logger.error(f"FAISS build failed: {e}")
         return None
 
-def load_vector_store_sync():
-    import_langchain_dependencies()
-    if not HuggingFaceEmbeddings or not FAISS:
-        logger.error("Cannot load vector store: LangChain dependencies failed to import.")
+async def load_vector_store() -> Optional[Any]:
+    await import_langchain()
+    if not FAISS or not HuggingFaceEmbeddings:
         return None
 
-    logger.info(f"Attempting to load index from: {INDEX_DIR.resolve()}")
-    vs = None
-    try:
-        index_file_path = INDEX_DIR / "index.faiss"
-        
-        # --- FIX: Ensure MANUALS_DIR and INDEX_DIR exist before proceeding, 
-        # but rely on the Dockerfile for ownership/creation in a safe space (/app)
-        MANUALS_DIR.mkdir(parents=True, exist_ok=True)
-        INDEX_DIR.mkdir(parents=True, exist_ok=True)
-        # --- END FIX ---
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    index_file = INDEX_DIR / "index.faiss"
 
-        if index_file_path.exists():
-            try:
-                logger.info(f"Initializing embedding model for loading: {EMBEDDING_MODEL}")
-                embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-                logger.info(f"Attempting to load FAISS index from {INDEX_DIR.resolve()}...")
-                # Note: allow_dangerous_deserialization=True is needed when loading from disk
-                vs = FAISS.load_local(str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True)
-                logger.info(f"Successfully loaded FAISS index from {INDEX_DIR.resolve()}")
-            except Exception as e:
-                logger.warning(f"Failed to load existing index from {INDEX_DIR.resolve()}: {e}. Will rebuild.", exc_info=True)
-                vs = None
-        else:
-            logger.info(f"Index file {index_file_path.resolve()} not found. Will build index.")
-
-        if vs is None:
-            logger.info(f"Building index from PDFs in {MANUALS_DIR.resolve()}")
-            
-            pages = load_pdfs(MANUALS_DIR)
-            if not pages:
-                logger.error("No PDF pages found to build index. Vector store cannot be created.")
-                return None
-
-            chunks = chunk_documents(pages)
-            if not chunks:
-                 logger.error("No chunks created from PDFs. Vector store cannot be created.")
-                 return None
-
-            vs = build_faiss(chunks, INDEX_DIR)
-
-    except Exception as e:
-        logger.error(f"Critical error during FAISS index loading/building: {e}", exc_info=True)
-        vs = None
-
-    return vs
-
-# --- Gemini & Google Search Utilities (Lazy Loaded) ---
-def get_genai_model() -> Optional[GenerativeModel]:
-# ... (rest of the functions remain unchanged)
-# The rest of your main.py file should remain unchanged from the previous version.
-# Only the path resolution and error handling in load_vector_store_sync and load_pdfs were modified.
-    import_genai_dependencies()
-    if not GenerativeModel: # Check if import failed
-        return None
-
-    if app_state.get("genai_model") is None and API_KEY_TO_USE:
-        logger.info("Initializing Google GenAI model...")
+    if index_file.exists():
         try:
-            genai.configure(api_key=API_KEY_TO_USE)
-            # Use the globally imported (and potentially corrected) GenerativeModel
-            model = GenerativeModel(GEMINI_MODEL_NAME)
-            logger.info(f"Initialized genai.GenerativeModel: {GEMINI_MODEL_NAME}")
-            app_state["genai_model"] = model
+            vs = FAISS.load_local(
+                str(INDEX_DIR), embeddings,
+                allow_dangerous_deserialization=True  # Safe: built in CI
+            )
+            logger.info("Loaded FAISS index.")
+            return vs
         except Exception as e:
-            logger.error(f"Failed to initialize genai model: {e}", exc_info=True)
-            app_state["genai_model"] = None
-    elif not API_KEY_TO_USE:
-         if app_state.get("genai_model", "not_set") == "not_set":
-            logger.warning("Cannot initialize GenAI model: API key not set.")
-            app_state["genai_model"] = None
+            logger.warning(f"Index load failed: {e}. Rebuilding...")
 
-    return app_state.get("genai_model")
-
-def get_google_search_service() -> Optional[Any]:
-    import_google_search_dependencies() # Ensure google_build is imported
-    if not google_build: # Check if import failed
+    logger48.info("Building FAISS index from PDFs...")
+    pages = await load_pdfs()
+    if not pages:
+        logger.error("No PDF content.")
         return None
 
-    if app_state.get("google_search") is None and GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID:
-        logger.info("Initializing Google Custom Search service...")
-        try:
-            # Use the globally imported google_build
-            service = google_build("customsearch", "v1", developerKey=GOOGLE_SEARCH_API_KEY)
-            logger.info("Initialized Google Custom Search service.")
-            app_state["google_search"] = service
-        except Exception as e:
-            logger.error(f"Failed to initialize Google Search service: {e}", exc_info=True)
-            app_state["google_search"] = None
-    elif not (GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID):
-        if app_state.get("google_search", "not_set") == "not_set":
-             logger.warning("Cannot initialize Google Search: API Key or CSE ID not set.")
-             app_state["google_search"] = None
-
-    return app_state.get("google_search")
-
-def extract_text_from_genai_response(response: Any) -> Optional[str]:
-    # (Same robust extractor as before)
-    try:
-        if hasattr(response, 'text') and response.text: return response.text.strip()
-        if hasattr(response, 'parts') and response.parts and hasattr(response.parts[0], 'text'):
-            return response.parts[0].text.strip()
-        if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            logger.warning(f"Gemini response blocked. Reason: {response.prompt_feedback.block_reason}")
-            return f"Error: Response blocked due to {response.prompt_feedback.block_reason}."
-        logger.warning(f"Could not extract text using standard methods. Response: {str(response)[:500]}")
-        return None
-    except Exception as e:
-        logger.error(f"Error extracting text from Gemini response: {e}", exc_info=True)
+    chunks = await chunk_documents(pages)
+    if not chunks:
         return None
 
-def generate_with_gemini(model: GenerativeModel, prompt_text: str) -> Optional[str]:
-    import_genai_dependencies() # Ensure GenerationConfig is imported and available
-    if not GenerationConfig:
-        logger.error("Cannot generate with Gemini: GenerationConfig not imported.")
-        return None
-    if model is None:
-        logger.error("generate_with_gemini called but model is None.")
+    return await build_faiss(chunks)
+
+# --- Gemini & Search ---
+async def get_genai_model() -> Optional[Any]:
+    if app_state["genai_model"]:
+        return app_state["genai_model"]
+
+    if not API_KEY_TO_USE:
+        logger.warning("Gemini API key missing.")
         return None
 
-    generation_config_params = {}
-    if GEMINI_MAX_TOKENS:
-        generation_config_params["max_output_tokens"] = GEMINI_MAX_TOKENS
-    if GEMINI_TEMPERATURE is not None:
-        generation_config_params["temperature"] = GEMINI_TEMPERATURE
+    await import_genai()
+    if not GenerativeModel:
+        return None
 
     try:
-        logger.debug(f"Sending prompt to Gemini (first 100 chars): {prompt_text[:100]}...")
-        # Use the globally imported GenerationConfig
-        gen_config = GenerationConfig(**generation_config_params) if generation_config_params else None
-        response = model.generate_content(
-             prompt_text,
-             generation_config=gen_config,
-        )
-        txt = extract_text_from_genai_response(response)
-        if txt:
-            logger.debug("Received non-empty response from Gemini.")
-            return txt
-        else:
-            return None
+        genai.configure(api_key=API_KEY_TO_USE)
+        model = GenerativeModel(GEMINI_MODEL_NAME)
+        app_state["genai_model"] = model
+        logger.info(f"Gemini initialized: {GEMINI_MODEL_NAME}")
+        return model
     except Exception as e:
-        logger.error(f"Gemini API call failed: {e}", exc_info=True)
+        logger.error(f"Gemini init failed: {e}")
         return None
 
-def perform_google_search(service: Any, query: str, cse_id: str, num_results: int = 3) -> List[Dict[str, Any]]:
-    import_google_search_dependencies() # Ensure HttpError is imported
-    if not HttpError:
-        logger.error("Cannot perform Google Search: HttpError not imported.")
-        return [{"source": "#", "title": "Search Error", "snippet": "Google Search client library failed to import.", "rank": 1, "type": "Error"}]
+def get_google_search() -> Optional[Any]:
+    if app_state["google_search"]:
+        return app_state["google_search"]
 
-    search_results: List[Dict[str, Any]] = []
-    if not service or not cse_id:
-        logger.warning("Google Search called but service/CSE ID not configured.")
-        return search_results
+    if not (GOOGLE_SEARCH_API_KEY and GOOGLE_CSE_ID):
+        return None
+
     try:
-        logger.info(f"Executing Google Search for query: {query}")
-        # Use the globally imported HttpError
-        results = service.cse().list(q=query, cx=cse_id, num=num_results).execute()
-        items = results.get("items", [])
-        logger.info(f"Google Search returned {len(items)} results.")
-        for i, item in enumerate(items):
-            search_results.append({
-                "source": item.get("link", "#"),
-                "title": item.get("title", "No Title"),
-                "snippet": item.get("snippet", "No Snippet"),
-                "rank": i + 1,
-                "type": "Web"
-            })
-        return search_results
-    except HttpError as he:
-        logger.error(f"Google Search HTTP error: {he.resp.status} - {he._get_reason()}", exc_info=False) # Log less verbosely for HTTP errors
-        return [{"source": "#", "title": "Search Error", "snippet": f"Google Search failed (HTTP {he.resp.status}). Check API key/CSE ID.", "rank": 1, "type": "Error"}]
+        service = google_build("customsearch", "v1", developerKey=GOOGLE_SEARCH_API_KEY)
+        app_state["google_search"] = service
+        return service
     except Exception as e:
-        logger.error(f"Google Search error: {e}", exc_info=True)
-        return [{"source": "#", "title": "Search Error", "snippet": f"Google Search failed: {e}", "rank": 1, "type": "Error"}]
+        logger.error(f"Google Search init failed: {e}")
+        return None
 
-# --- FastAPI Startup Event ---
+def google_search(query: str, num: int) -> List[Dict]:
+    service = get_google_search()
+    if not service:
+        return []
+
+    try:
+        res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=num).execute()
+        items = res.get("items", [])
+        return [
+            {
+                "type": "Web",
+                "source": i.get("link", "#"),
+                "title": i.get("title", "No Title"),
+                "snippet": i.get("snippet", ""),
+                "rank": idx + 1
+            }
+            for idx, i in enumerate(items)
+        ]
+    except HttpError as e:
+        logger.error(f"Search HTTP {e.resp.status}")
+        return [{"type": "Error", "snippet": f"HTTP {e.resp.status}"}]
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        return [{"type": "Error", "snippet": "Search failed"}]
+
+# --- Startup ---
 @app.on_event("startup")
-async def startup_event():
-    logger.info("Application startup initiated: Loading/building FAISS index...")
-    loop = asyncio.get_event_loop()
-    vector_store = await loop.run_in_executor(None, load_vector_store_sync)
-    app_state["vector_store"] = vector_store
-    if app_state["vector_store"]:
-        logger.info("FAISS index loading/building completed successfully.")
+async def startup():
+    logger.info("Starting up: loading FAISS index...")
+    vs = await load_vector_store()
+    app_state["vector_store"] = vs
+    if vs:
+        logger.info("RAG ready.")
     else:
-        logger.error("FAISS index failed to load or build during startup. RAG features unavailable.")
+        logger.error("RAG failed to load.")
 
-# --- API Endpoints ---
+# --- Endpoints ---
 @app.get("/")
 def root():
-    return {"message": "Customer Support Chatbot Backend", "index_ready": app_state.get("vector_store") is not None}
+    return {"message": "RAG Chatbot", "index_ready": app_state["vector_store"] is not None}
 
 @app.get("/health")
 def health():
-    vs = app_state.get("vector_store")
-    # Safely check length only if vs exists and has the attribute
-    num_docs = 0
-    if vs and hasattr(vs, 'index_to_docstore_id'):
-        try:
-            num_docs = len(vs.index_to_docstore_id)
-        except Exception:
-            logger.warning("Could not get num_docs_indexed from vector store.")
-    return {
-        "status": "ok",
-        "index_ready": vs is not None,
-        "num_docs_indexed": num_docs
-    }
+    vs = app_state["vector_store"]
+    num = len(getattr(vs, "index_to_docstore_id", {})) if vs else 0
+    return {"status": "ok", "index_ready": vs is not None, "docs": num}
 
 @app.post("/reindex")
-async def reindex_endpoint():
-    logger.info("Reindex endpoint called. Reloading/rebuilding FAISS index...")
-    loop = asyncio.get_event_loop()
-    vector_store = await loop.run_in_executor(None, load_vector_store_sync) # Re-run load/build
-    app_state["vector_store"] = vector_store # Update state
-    vs = app_state.get("vector_store")
+async def reindex():
+    logger.info("Reindexing...")
+    vs = await load_vector_store()
+    app_state["vector_store"] = vs
     if not vs:
-        raise HTTPException(status_code=500, detail="Reindex failed. Check application logs for errors.")
-    logger.info("Reindex completed successfully.")
-    num_docs = len(vs.index_to_docstore_id) if hasattr(vs, 'index_to_docstore_id') else 0
-    return {"status": "ok", "num_docs_indexed": num_docs}
+        raise HTTPException(500, "Reindex failed")
+    return {"status": "ok", "docs": len(vs.index_to_docstore_id)}
 
 @app.post("/ask")
-def ask(req: AskRequest):
-    q = req.question.strip() if req.question else ""
-    if not q: raise HTTPException(status_code=400, detail="Question cannot be empty.")
+async def ask(req: AskRequest):
+    q = req.question.strip()
+    if not q:
+        raise HTTPException(400, "Question required")
 
-    vs = app_state.get("vector_store")
+    vs = app_state["vector_store"]
+    sources: List[Dict] = []
+    context_parts: List[str] = []
 
-    if vs is None and not req.web_search:
-        logger.error("Request failed: Vector store not ready and web search disabled.")
-        raise HTTPException(status_code=503, detail="Chatbot is not ready (vector store unavailable). Please try again later or enable web search.")
-
-    all_sources: List[Dict[str, Any]] = []
-    retrieved_context_parts = []
-
-    # 1) RAG retrieval
+    # RAG
     if vs:
-        logger.info(f"Performing similarity search for query (first 50 chars): '{q[:50]}...'")
         try:
-            import_langchain_dependencies() # Ensure FAISS etc. are available
-            if FAISS:
-                hits = vs.similarity_search(q, k=TOP_K)
-                if hits:
-                    logger.info(f"Found {len(hits)} relevant document chunks.")
-                    for i, d in enumerate(hits, start=1):
-                        src = d.metadata.get("source", "Unknown PDF") if hasattr(d, 'metadata') and d.metadata else "Unknown PDF"
-                        content = getattr(d, 'page_content', '')
-                        header = f"[PDF Result {i}] Source: {src}"
-                        retrieved_context_parts.append(f"{header}\n{content}")
-                        source_key = f"PDF_{src}"
-                        if source_key not in [f"{s.get('type')}_{s.get('source')}" for s in all_sources]:
-                            all_sources.append({"type": "PDF", "source": src, "rank": i})
-                else: logger.info("No relevant document chunks found in vector store.")
-            else: logger.error("FAISS library was not loaded correctly, cannot perform search.")
+            docs = vs.similarity_search(q, k=TOP_K)
+            for i, d in enumerate(docs, 1):
+                src = d.metadata.get("source", "Unknown")
+                context_parts.append(f"[PDF {i}] {src}\n{d.page_content}")
+                sources.append({"type": "PDF", "source": src, "rank": i})
         except Exception as e:
-            logger.error(f"Error during similarity search: {e}", exc_info=True)
-            retrieved_context_parts.append("[Error during document search]")
-    else: logger.warning("Vector store not available for RAG retrieval.")
+            logger.error(f"RAG failed: {e}")
+            context_parts.append("[RAG Error]")
 
-    # 2) Web search
-    web_results_context_parts = []
+    # Web
     if req.web_search:
-        search_service = get_google_search_service()
-        if search_service:
-            web_results = perform_google_search(search_service, q, GOOGLE_CSE_ID, num_results=req.web_num_results or 3)
-            valid_web_results = [res for res in web_results if res.get("type") != "Error"]
-            if valid_web_results:
-                 logger.info(f"Found {len(valid_web_results)} web results.")
-                 for res in valid_web_results:
-                     header = f"[Web Result {res.get('rank', '?')}] Title: {res.get('title', 'N/A')}"
-                     web_results_context_parts.append(f"{header}\n{res.get('snippet', '')}\nURL: {res.get('source', '#')}")
-                     all_sources.append(res)
-            else: logger.info("No valid web results found.")
-            for res in web_results:
-                 if res.get("type") == "Error": logger.error(f"Web search error encountered: {res.get('snippet')}")
-        else: logger.warning("Web search requested but Google Search service is unavailable.")
+        results = google_search(q, req.web_num_results or 3)
+        for r in results:
+            if r["type"] == "Web":
+                context_parts.append(f"[Web {r['rank']}] {r['title']}\n{r['snippet']}\nURL: {r['source']}")
+                sources.append(r)
 
-    # 3) Compose context
-    combined_contexts = []
-    if retrieved_context_parts: combined_contexts.append("Relevant document sections:\n" + "\n\n---\n\n".join(retrieved_context_parts))
-    if web_results_context_parts: combined_contexts.append("Web search results:\n" + "\n\n---\n\n".join(web_results_context_parts))
+    if not context_parts:
+        return {
+            "answer": "No relevant information found.",
+            "sources": sources,
+            "source_context": ""
+        }
 
-    if not combined_contexts:
-        logger.warning(f"No context generated for query: {q}")
-        answer = "Sorry, I couldn't find any relevant information."
-        # Add more details if possible
-        search_service_available = get_google_search_service() is not None
-        if vs is None and req.web_search and not search_service_available: answer += " (Document store and web search are currently unavailable)."
-        elif vs is None: answer += " (Document store is currently unavailable)."
-        elif req.web_search and not search_service_available: answer += " (Web search is currently unavailable)."
-        return {"answer": answer, "sources": all_sources, "source_context": ""}
+    context = "\n\n---\n\n".join(context_parts)
+    display_ctx = context[:4000]
 
-    combined_context = "\n\n===\n\n".join(combined_contexts)
-    source_context_for_display = combined_context[:4000]
-
-    # 4) Generate answer
-    genai_model_instance = get_genai_model()
-    if genai_model_instance:
+    # Gemini
+    model = await get_genai_model()
+    if model:
+        prompt = (
+            "You are a concise support agent. Use ONLY the context below to answer in 2–4 sentences. "
+            "If unsure, say so. Do not hallucinate.\n\n"
+            f"Context:\n{context}\n\nQuestion: {q}\nAnswer:"
+        )
         try:
-            prompt = (
-                "You are a concise and helpful customer support assistant. Use ONLY the Context below (document sections and web search results) to answer the Question in 2-4 sentences. "
-                "Prioritize information from the 'Relevant document sections' if available. If the Context does not contain the answer, state that clearly. Do not make information up.\n\n"
-                f"Context:\n{combined_context}\n\nQuestion:\n{q}\n\nAnswer:"
-            )
-            gen_answer = generate_with_gemini(genai_model_instance, prompt)
-            if gen_answer:
-                return {"answer": gen_answer, "sources": all_sources, "source_context": source_context_for_display}
-            else:
-                logger.warning("Gemini generation returned None or was blocked. Falling back.")
+            config = {}
+            if GEMINI_MAX_TOKENS: config["max_output_tokens"] = GEMINI_MAX_TOKENS
+            if GEMINI_TEMPERATURE is not None: config["temperature"] = GEMINI_TEMPERATURE
+
+            resp = model.generate_content(prompt, generation_config=config or None)
+            answer = resp.text.strip() if hasattr(resp, "text") and resp.text else None
+            if answer:
+                return {"answer": answer, "sources": sources, "source_context": display_ctx}
         except Exception as e:
-            logger.warning(f"Gemini generation raised an exception ({e}). Falling back.")
-    else:
-        logger.warning("Gemini model not available. Falling back.")
+            logger.warning(f"Gemini failed: {e}")
 
-    # Fallback: return combined context
-    logger.info("Falling back to returning combined context for query: %s", q[:50])
-    fallback_answer = "Based on the retrieved information:\n\n" + combined_context
-    if len(fallback_answer) > 4000: fallback_answer = fallback_answer[:3900] + "\n\n...[Context Truncated]"
-    return {"answer": fallback_answer, "sources": all_sources, "source_context": source_context_for_display}
+    # Fallback
+    fallback = "Based on sources:\n\n" + context
+    if len(fallback) > 4000:
+        fallback = fallback[:3900] + "\n\n...[truncated]"
+    return {"answer": fallback, "sources": sources, "source_context": display_ctx}
 
-# --- Local Run ---
+# --- Local dev ---
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting Uvicorn server locally for testing...")
     port = int(os.getenv("PORT", 8000))
-    # reload=True can cause issues with startup events in some cases, monitor if needed
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
