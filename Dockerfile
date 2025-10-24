@@ -1,52 +1,54 @@
-# build_index.py - Project root
-from pathlib import Path
-import logging
+# ---------- Builder ----------
+FROM python:3.10-slim AS builder
+WORKDIR /app
 
-from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libblas3 libopenblas-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-logging.basicConfig(level="INFO")
-logger = logging.getLogger("build_index")
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
-# Paths inside container (match Dockerfile)
-MANUALS_DIR = Path("/app/backend/data/manuals")
-INDEX_DIR = Path("/app/backend/vector_store/support_index")
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-def main():
-    logger.info(f"Loading PDFs from {MANUALS_DIR}")
-    docs = []
-    for pdf_path in MANUALS_DIR.glob("*.pdf"):
-        try:
-            loader = PyPDFLoader(str(pdf_path))
-            pages = loader.load()
-            for page in pages:
-                page.metadata["source"] = pdf_path.name
-            docs.extend(pages)
-            logger.info(f"Loaded {len(pages)} pages from {pdf_path.name}")
-        except Exception as e:
-            logger.error(f"Failed to load {pdf_path.name}: {e}")
+# Copy code + data
+COPY backend/. .
+COPY backend/data/manuals/ /app/backend/data/manuals/
 
-    if not docs:
-        logger.error("No PDF content found. Exiting.")
-        return
+# Build index (downloads + caches model)
+COPY build_index.py .
+RUN python build_index.py
 
-    logger.info(f"Chunking {len(docs)} pages...")
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
-    logger.info(f"Created {len(chunks)} chunks")
+# ---------- Runtime ----------
+FROM python:3.10-slim
+WORKDIR /app
 
-    logger.info(f"Downloading and caching model: {MODEL_NAME}")
-    embeddings = HuggingFaceEmbeddings(model_name=MODEL_NAME)
+ENV DATA_DIR=/app/backend/data \
+    MANUALS_DIR=/app/backend/data/manuals \
+    INDEX_DIR=/app/backend/vector_store/support_index \
+    PORT=8000
 
-    logger.info("Building FAISS index...")
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+RUN useradd -m appuser
 
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    vectorstore.save_local(str(INDEX_DIR))
-    logger.info(f"FAISS index saved to {INDEX_DIR}")
+RUN mkdir -p ${DATA_DIR} ${MANUALS_DIR} ${INDEX_DIR} \
+    && chown -R appuser:appuser /app
 
-if __name__ == "__main__":
-    main()
+# Copy venv
+COPY --from=builder --chown=appuser:appuser /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Copy app + data
+COPY --chown=appuser:appuser backend/. .
+COPY --chown=appuser:appuser backend/data/manuals/ ${MANUALS_DIR}/
+
+# Copy pre-built index
+COPY --from=builder --chown=appuser:appuser /app/backend/vector_store/support_index/ ${INDEX_DIR}/
+
+# --- COPY HF CACHE (critical!) ---
+COPY --from=builder --chown=appuser:appuser /root/.cache/huggingface /home/appuser/.cache/huggingface
+
+USER appuser
+EXPOSE ${PORT}
+
+CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:${PORT}"]
