@@ -55,7 +55,7 @@ TOP_K = int(os.getenv("TOP_K", "3"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 API_KEY_TO_USE = GOOGLE_API_KEY or GEMINI_API_KEY
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Max tokens
 try:
@@ -315,4 +315,5 @@ async def ask(req: AskRequest):
     if len(fallback) > 4000:
         fallback = fallback[:3900] + "\n\n...[truncated]"
     return {"answer": fallback, "sources": sources, "source_context": display_ctx}
+
 
