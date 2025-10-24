@@ -51,4 +51,4 @@ COPY --from=builder --chown=appuser:appuser /root/.cache/huggingface /home/appus
 USER appuser
 EXPOSE ${PORT}
 
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "main:app", "--bind", "0.0.0.0:${PORT}"]
+CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "backend.main:app", "--bind", "0.0.0.0:${PORT}"]
