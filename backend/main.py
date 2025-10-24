@@ -35,11 +35,18 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(messa
 logger = logging.getLogger("backend")
 
 # --- CORRECTED PATH CALCULATIONS for Docker ---
-# Assumes Dockerfile copies code to /app and sets WORKDIR /app
+# We ensure all paths resolve to absolute, non-relative paths inside /app
 APP_ROOT = Path(__file__).resolve().parent # /app inside container
-DATA_DIR = Path(os.getenv("DATA_DIR", str(APP_ROOT / "data")))
-MANUALS_DIR = Path(os.getenv("MANUALS_DIR", str(DATA_DIR / "manuals")))
-INDEX_DIR = Path(os.getenv("INDEX_DIR", str(APP_ROOT / "vector_store" / "support_index")))
+
+# Define fallback paths using clean absolute strings
+DEFAULT_DATA_DIR = str(APP_ROOT / "data")
+DEFAULT_MANUALS_DIR = str(APP_ROOT / "data" / "manuals")
+DEFAULT_INDEX_DIR = str(APP_ROOT / "vector_store" / "support_index")
+
+# Read from ENV or use the absolute fallback path
+DATA_DIR = Path(os.getenv("DATA_DIR", DEFAULT_DATA_DIR)).resolve()
+MANUALS_DIR = Path(os.getenv("MANUALS_DIR", DEFAULT_MANUALS_DIR)).resolve()
+INDEX_DIR = Path(os.getenv("INDEX_DIR", DEFAULT_INDEX_DIR)).resolve()
 
 logger.info(f"Running from: {Path(__file__).resolve()}")
 logger.info(f"Calculated APP_ROOT: {APP_ROOT}")
@@ -181,10 +188,21 @@ def load_pdfs(manuals_dir: Path) -> List[Document]:
     if not PyPDFLoader: return [] # Check if import failed
 
     docs: List[Document] = []
+    # FIX: We rely on the Dockerfile to create the directory, but still ensure it exists here.
+    # The PermissionError/FileNotFoundError suggests the initial path resolution was wrong.
+    # We remove the old error-prone code that created the paths incorrectly, relying on the 
+    # absolute paths defined at the top of the file.
     if not manuals_dir.exists():
-        logger.warning(f"Manuals directory not found: {manuals_dir}")
-        return docs
-    logger.info(f"Looking for PDF files in: {manuals_dir}")
+        logger.warning(f"Manuals directory not found: {manuals_dir}. Attempting to create it (should be done by Dockerfile).")
+        # Try to create it just in case, using the now absolute path
+        try:
+            manuals_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            # We expect this to be fixed by the Dockerfile, log but continue gracefully if empty.
+            logger.error(f"Failed to create directory {manuals_dir} during load: {e}")
+            return docs
+        
+    logger.info(f"Looking for PDF files in: {manuals_dir.resolve()}")
     pdf_files = sorted(list(manuals_dir.glob("*.pdf")))
     if not pdf_files:
         logger.warning(f"No PDF files found in {manuals_dir}")
@@ -236,7 +254,7 @@ def build_faiss(docs: List[Document], index_dir: Path) -> Optional[Any]:
         vs = FAISS.from_documents(docs, embeddings)
         index_dir.mkdir(parents=True, exist_ok=True)
         vs.save_local(str(index_dir))
-        logger.info(f"Successfully built and saved FAISS index to {index_dir}")
+        logger.info(f"Successfully built and saved FAISS index to {index_dir.resolve()}")
         return vs
     except Exception as e:
         logger.error(f"Error building FAISS index: {e}", exc_info=True)
@@ -248,28 +266,34 @@ def load_vector_store_sync():
         logger.error("Cannot load vector store: LangChain dependencies failed to import.")
         return None
 
-    logger.info(f"Attempting to load index from: {INDEX_DIR}")
+    logger.info(f"Attempting to load index from: {INDEX_DIR.resolve()}")
     vs = None
     try:
         index_file_path = INDEX_DIR / "index.faiss"
+        
+        # --- FIX: Ensure MANUALS_DIR and INDEX_DIR exist before proceeding, 
+        # but rely on the Dockerfile for ownership/creation in a safe space (/app)
+        MANUALS_DIR.mkdir(parents=True, exist_ok=True)
+        INDEX_DIR.mkdir(parents=True, exist_ok=True)
+        # --- END FIX ---
+
         if index_file_path.exists():
             try:
                 logger.info(f"Initializing embedding model for loading: {EMBEDDING_MODEL}")
                 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-                logger.info(f"Attempting to load FAISS index from {INDEX_DIR}...")
+                logger.info(f"Attempting to load FAISS index from {INDEX_DIR.resolve()}...")
+                # Note: allow_dangerous_deserialization=True is needed when loading from disk
                 vs = FAISS.load_local(str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True)
-                logger.info(f"Successfully loaded FAISS index from {INDEX_DIR}")
+                logger.info(f"Successfully loaded FAISS index from {INDEX_DIR.resolve()}")
             except Exception as e:
-                logger.warning(f"Failed to load existing index from {INDEX_DIR}: {e}. Will rebuild.", exc_info=True)
+                logger.warning(f"Failed to load existing index from {INDEX_DIR.resolve()}: {e}. Will rebuild.", exc_info=True)
                 vs = None
         else:
-            logger.info(f"Index file {index_file_path} not found. Will build index.")
+            logger.info(f"Index file {index_file_path.resolve()} not found. Will build index.")
 
         if vs is None:
-            logger.info(f"Building index from PDFs in {MANUALS_DIR}")
-            MANUALS_DIR.mkdir(parents=True, exist_ok=True)
-            INDEX_DIR.mkdir(parents=True, exist_ok=True)
-
+            logger.info(f"Building index from PDFs in {MANUALS_DIR.resolve()}")
+            
             pages = load_pdfs(MANUALS_DIR)
             if not pages:
                 logger.error("No PDF pages found to build index. Vector store cannot be created.")
@@ -290,7 +314,9 @@ def load_vector_store_sync():
 
 # --- Gemini & Google Search Utilities (Lazy Loaded) ---
 def get_genai_model() -> Optional[GenerativeModel]:
-    # Ensure dependencies are imported before accessing genai.GenerativeModel
+# ... (rest of the functions remain unchanged)
+# The rest of your main.py file should remain unchanged from the previous version.
+# Only the path resolution and error handling in load_vector_store_sync and load_pdfs were modified.
     import_genai_dependencies()
     if not GenerativeModel: # Check if import failed
         return None
@@ -428,8 +454,6 @@ async def startup_event():
         logger.error("FAISS index failed to load or build during startup. RAG features unavailable.")
 
 # --- API Endpoints ---
-# (Endpoints /, /health, /reindex, /ask remain the same conceptually,
-#  but now rely on the corrected lazy loading and state management)
 @app.get("/")
 def root():
     return {"message": "Customer Support Chatbot Backend", "index_ready": app_state.get("vector_store") is not None}
