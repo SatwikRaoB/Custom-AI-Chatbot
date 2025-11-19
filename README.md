@@ -4,3 +4,4 @@ This project implements a support chatbot using LangChain, Gemini API, Google Se
 
 Demo: https://custom-ai-chatbot-frontend-54452819884.us-central1.run.app/
 
+** the demo is currently a placeholder since running the website 24/7 even with 0 minimum instances will incur costs **
